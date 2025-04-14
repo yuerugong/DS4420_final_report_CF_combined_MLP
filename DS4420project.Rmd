@@ -1,0 +1,225 @@
+---
+title: "DS4420project"
+output:
+  html_document: default
+  pdf_document: default
+date: "2025-04-14"
+---
+
+```{r}
+# Load required libraries
+library(tidyverse)
+library(lubridate)
+
+# Read the dataset
+file_path <- "customer_shopping_data.csv"
+df <- read_csv(file_path)
+
+# Create a copy to avoid modifying the original data
+df_cleaned <- df
+
+# Convert 'invoice_date' to datetime and extract month and hour
+df_cleaned <- df_cleaned %>%
+  mutate(
+    invoice_date = dmy(invoice_date),  # assumes day-first format
+    OrderMonth = month(invoice_date),
+    OrderHour = hour(invoice_date)
+  )
+
+# Calculate a simple "score" as quantity × price
+df_cleaned <- df_cleaned %>%
+  mutate(Score = quantity * price)
+
+# Encode categorical features as numeric (factor levels)
+df_cleaned <- df_cleaned %>%
+  mutate(
+    gender_enc = as.numeric(as.factor(gender)) - 1,
+    payment_method_enc = as.numeric(as.factor(payment_method)) - 1,
+    category_enc = as.numeric(as.factor(category)) - 1,
+    shopping_mall_enc = as.numeric(as.factor(shopping_mall)) - 1
+  )
+
+# Create user-level aggregated behavior features
+user_stats <- df_cleaned %>%
+  group_by(customer_id) %>%
+  summarise(
+    total_orders = n_distinct(invoice_no),
+    avg_spent = mean(Score, na.rm = TRUE),
+    total_spent = sum(Score, na.rm = TRUE),
+    unique_categories = n_distinct(category)
+  )
+
+# Merge aggregated user features back into the main data frame
+df_customer_shopping <- df_cleaned %>%
+  left_join(user_stats, by = "customer_id")
+
+# Keep only records where quantity and price are both greater than 0
+df_customer_shopping <- df_customer_shopping %>%
+  filter(quantity > 0, price > 0)
+
+# Print the number of rows and count of missing values per column
+cat("number of rows: ", nrow(df_customer_shopping), "\n")
+print(colSums(is.na(df_customer_shopping)))
+
+# Final cleaned dataset
+df_customer_shopping
+
+```
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(caret)
+library(keras)
+library(tensorflow)
+
+# Read the CF scores and cleaned dataset
+cf_scores <- read_csv("/Users/gongyueru/DS4420/cf_scores_for_mlp.csv")
+
+# Clean df_ready: drop all .y columns and rename .x columns to clean names
+df_ready_cleaned <- df_customer_shopping
+
+# Merge CF scores
+df_with_cf <- df_ready_cleaned %>%
+  inner_join(cf_scores %>% select(customer_id, category, cf_score_scaled),
+             by = c("customer_id", "category"))
+
+# Define features and target
+feature_columns <- c("age", "gender_enc", "payment_method_enc", "category_enc", "cf_score_scaled")
+target_column <- "Score"
+
+df_with_cf <- df_with_cf %>%
+  mutate(log_score = log1p(Score))  # log(Score + 1)
+
+# Extract features and target
+X <- df_with_cf %>% select(all_of(feature_columns)) %>% as.matrix()
+y <- df_with_cf$log_score
+
+# Scale features
+preproc <- preProcess(X, method = c("center", "scale"))
+X_scaled <- predict(preproc, X)
+
+# Train/test split
+set.seed(42)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+X_train <- X_scaled[train_index, ]
+X_test <- X_scaled[-train_index, ]
+y_train <- y[train_index]
+y_test <- y[-train_index]
+
+# Define MLP model
+model <- keras_model_sequential() %>%
+  layer_dense(units = 128, activation = "relu", input_shape = ncol(X_train)) %>%
+  layer_dropout(rate = 0.4) %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dense(units = 1)  # Output layer for regression
+
+# Compile the model
+model %>% compile(
+  optimizer = "adam",
+  loss = "mse"
+)
+
+# Train the model
+history <- model %>% fit(
+  x = X_train, y = y_train,
+  validation_split = 0.2,
+  epochs = 50,
+  batch_size = 64,
+  verbose = 1
+)
+```
+
+```{r}
+# Convert history to dataframe for plotting
+plot_df <- as.data.frame(history$metrics)
+plot_df$epoch <- 1:nrow(plot_df)
+
+# Plot training vs validation loss
+ggplot(plot_df, aes(x = epoch)) +
+  geom_line(aes(y = loss, color = "Training Loss")) +
+  geom_line(aes(y = val_loss, color = "Validation Loss")) +
+  labs(title = "Training vs Validation Loss", y = "Loss (MSE)", x = "Epoch") +
+  scale_color_manual(values = c("Training Loss" = "blue", "Validation Loss" = "red")) +
+  theme_minimal()
+```
+
+
+```{r}
+# transform log back to expm1
+y_pred_log <- model %>% predict(X_test) %>% as.vector()
+y_pred <- expm1(y_pred_log)  # inverse of log1p
+y_true <- expm1(y_test)
+
+# plot the true vs predict
+ggplot(data.frame(True = y_true, Predicted = y_pred), aes(x = True, y = Predicted)) +
+  geom_point(alpha = 0.4, color = "darkgreen") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Predicted vs Actual Scores", x = "Actual Score", y = "Predicted Score") +
+  theme_minimal()
+```
+
+```{r}
+# Predict and evaluate
+y_pred <- model %>% predict(X_test) %>% as.vector()
+rmse <- sqrt(mean((y_test - y_pred)^2))
+mae <- mean(abs(y_test - y_pred))
+
+cat(sprintf("RMSE: %.2f\n", rmse))
+cat(sprintf("MAE: %.2f\n", mae))
+
+```
+
+
+
+```{r}
+# get all the customer with all catergory of goods
+all_user_category <- expand.grid(
+  customer_id = unique(df_customer_shopping$customer_id),
+  category = unique(df_customer_shopping$category)
+)
+
+# delete the category that user already buy
+bought_pairs <- df_customer_shopping %>% select(customer_id, category)
+candidates <- anti_join(all_user_category, bought_pairs, by = c("customer_id", "category"))
+
+# get all the user's info from the original data
+user_info <- df_customer_shopping %>%
+  select(customer_id, age, gender_enc, payment_method_enc) %>%
+  distinct()
+
+# get all the category with the encode info from the data
+category_info <- df_customer_shopping %>%
+  select(category, category_enc) %>%
+  distinct()
+
+# join all the data into a new data be the recommended customer
+candidates <- candidates %>%
+  left_join(user_info, by = "customer_id") %>%
+  left_join(category_info, by = "category") %>%
+  left_join(cf_scores %>% select(customer_id, category, cf_score_scaled),
+            by = c("customer_id", "category"))
+
+# predict by using the data and scale the data
+predict_X <- candidates %>%
+  select(age, gender_enc, payment_method_enc, category_enc, cf_score_scaled) %>%
+  as.matrix()
+
+# transform log back to original data
+predict_X_scaled <- predict(preproc, predict_X)
+
+predicted_log_scores <- model %>% predict(predict_X_scaled) %>% as.vector()
+candidates$predicted_score <- expm1(predicted_log_scores) 
+
+# recommend 3 items for each user 
+top_recommendations <- candidates %>%
+  group_by(customer_id) %>%
+  arrange(desc(predicted_score)) %>%
+  slice_head(n = 3) %>%
+  ungroup()
+
+# print out the top 30 prediction
+head(top_recommendations, 30)
+
+```
+
